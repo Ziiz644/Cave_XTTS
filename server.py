@@ -1,15 +1,15 @@
 import os
 import re
-import time
+import uuid
 import tempfile
-from typing import Optional, Dict, Any, Generator
+from typing import Optional, Generator, Any
 
 import numpy as np
 import httpx
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from TTS.api import TTS
 
@@ -22,21 +22,14 @@ DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ar").strip().lower()  # "ar" or "en"
 
 DEFAULT_SPEAKER_WAV = os.getenv("DEFAULT_SPEAKER_WAV", "").strip()
 
-# XTTS v2 commonly outputs 24000. We'll treat this as the ONLY supported PCM sample rate unless you resample.
 OUTPUT_SAMPLE_RATE = int(os.getenv("OUTPUT_SAMPLE_RATE", "24000"))
-
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "2000"))
 
-# Speaker download hardening
 MAX_SPEAKER_WAV_BYTES = int(os.getenv("MAX_SPEAKER_WAV_BYTES", str(8 * 1024 * 1024)))  # 8MB
 SPEAKER_HTTP_TIMEOUT = float(os.getenv("SPEAKER_HTTP_TIMEOUT", "20"))
 ALLOW_SPEAKER_URL = os.getenv("ALLOW_SPEAKER_URL", "true").lower() in ("1", "true", "yes", "y")
 
-# Chunking for "stream-like" behavior (generate sentence by sentence)
-# Smaller = more responsive streaming.
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "220"))
-
-# Concurrency control (VERY important on GPU)
 MAX_CONCURRENT_SYNTH = int(os.getenv("MAX_CONCURRENT_SYNTH", "1"))
 
 CORS_ORIGINS = os.getenv(
@@ -46,7 +39,7 @@ CORS_ORIGINS = os.getenv(
 
 # ------------------------------------------------
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
+app = FastAPI(title=APP_NAME, version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,13 +66,15 @@ class TtsRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
     language: str = Field(default=DEFAULT_LANG)
 
-    # Provide ONE:
-    speaker_wav_url: Optional[str] = None  # presigned URL (Wasabi)
-    speaker_wav_path: Optional[str] = None  # inside container
+    # Prefer this name:
+    speaker_wav_url: Optional[str] = None
+    speaker_wav_path: Optional[str] = None
 
-    # Output control
+    # ✅ Backward compat: accept "speaker_wav" from older clients
+    speaker_wav: Optional[str] = None
+
     format: str = Field(default="pcm")  # "pcm" or "wav"
-    sample_rate: int = Field(default=OUTPUT_SAMPLE_RATE)  # for pcm path we only support OUTPUT_SAMPLE_RATE
+    sample_rate: int = Field(default=OUTPUT_SAMPLE_RATE)
 
     @field_validator("language")
     @classmethod
@@ -96,6 +91,13 @@ class TtsRequest(BaseModel):
         if v not in ("pcm", "wav"):
             raise ValueError('format must be "pcm" or "wav"')
         return v
+
+    @model_validator(mode="after")
+    def normalize_speaker_fields(self):
+        # If caller used speaker_wav, treat it as speaker_wav_url
+        if (not self.speaker_wav_url) and self.speaker_wav:
+            self.speaker_wav_url = self.speaker_wav
+        return self
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -162,7 +164,7 @@ async def _download_to_temp(url: str) -> str:
                             continue
                         total += len(chunk)
                         if total > MAX_SPEAKER_WAV_BYTES:
-                            raise HTTPException(status_code=400, detail="speaker wav too large")
+                            raise HTTPException(status_code=400, detail="speaker wav too large (max 8MB)")
                         f.write(chunk)
 
         if total == 0:
@@ -185,9 +187,6 @@ async def _download_to_temp(url: str) -> str:
 
 
 def _float_to_s16le_pcm(audio: np.ndarray) -> bytes:
-    """
-    XTTS usually returns float32 numpy in [-1,1]. Convert to signed 16-bit little-endian PCM.
-    """
     if audio is None:
         return b""
     audio = np.asarray(audio, dtype=np.float32)
@@ -217,16 +216,12 @@ def health():
 
 
 @app.post("/tts")
-async def tts_stream(payload: TtsRequest = Body(...)):
-    """
-    JSON endpoint designed for Spring WebFlux:
-    - returns STREAMED bytes
-    - for format="pcm": application/octet-stream (s16le mono)
-    - for format="wav": audio/wav (NOT recommended for your current Java streamPcm)
-    """
+async def tts_stream(request: Request, payload: TtsRequest = Body(...)):
     global tts
     if tts is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
+
+    req_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
 
     text = (payload.text or "").strip()
     if not text:
@@ -238,8 +233,10 @@ async def tts_stream(payload: TtsRequest = Body(...)):
     fmt = payload.format
     sample_rate = int(payload.sample_rate or OUTPUT_SAMPLE_RATE)
 
-    # IMPORTANT: if you need resampling, we can add it later, but keep it strict for stability.
-    if fmt == "pcm" and sample_rate != OUTPUT_SAMPLE_RATE:
+    if fmt != "pcm":
+        raise HTTPException(status_code=400, detail="Use format=pcm for streaming integration")
+
+    if sample_rate != OUTPUT_SAMPLE_RATE:
         raise HTTPException(
             status_code=400,
             detail=f"PCM sample_rate must be {OUTPUT_SAMPLE_RATE} for this server (got {sample_rate})",
@@ -249,7 +246,6 @@ async def tts_stream(payload: TtsRequest = Body(...)):
 
     tmp_ref = None
     try:
-        # Resolve speaker reference
         speaker_wav_url = (payload.speaker_wav_url or "").strip() or None
         speaker_wav_path = (payload.speaker_wav_path or "").strip() or None
 
@@ -263,37 +259,22 @@ async def tts_stream(payload: TtsRequest = Body(...)):
             if not os.path.exists(ref_path):
                 raise HTTPException(status_code=400, detail=f"speaker_wav_path not found: {ref_path}")
 
-        # Chunk the text so client can start playing earlier (pseudo-streaming)
         chunks = chunk_text(text, MAX_CHUNK_CHARS)
 
         def gen() -> Generator[bytes, None, None]:
-            try:
-                for ch in chunks:
-                    # Generate per chunk
-                    audio = tts.tts(text=ch, speaker_wav=ref_path, language=language)
-
-                    if fmt == "pcm":
-                        yield _float_to_s16le_pcm(audio)
-                    else:
-                        # WAV streaming not used by your Java streamPcm
-                        # If you ever need it, we can add in-memory WAV encoding here.
-                        raise RuntimeError("format=wav not implemented in generator")
-            finally:
-                pass
+            for ch in chunks:
+                audio = tts.tts(text=ch, speaker_wav=ref_path, language=language)
+                yield _float_to_s16le_pcm(audio)
 
         headers = {
-            "X-Audio-Format": fmt,
+            "X-Request-Id": req_id,
+            "X-Audio-Format": "pcm",
             "X-Sample-Rate": str(OUTPUT_SAMPLE_RATE),
         }
 
-        if fmt == "pcm":
-            return StreamingResponse(gen(), media_type="application/octet-stream", headers=headers)
-        else:
-            # Not used in your current backend path
-            raise HTTPException(status_code=400, detail="Use format=pcm for streaming integration")
+        return StreamingResponse(gen(), media_type="application/octet-stream", headers=headers)
 
     finally:
-        # cleanup + release semaphore
         if tmp_ref and os.path.exists(tmp_ref):
             try:
                 os.remove(tmp_ref)
